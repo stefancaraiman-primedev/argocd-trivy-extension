@@ -14,33 +14,26 @@ async function fetchReportByUrl(reportUrl) {
 }
 
 /**
- * Find VulnerabilityReport by labels when direct fetch fails (e.g. hash-based names).
- * Uses Argo CD resource-tree to discover reports, then fetches each to match by labels.
+ * Find VulnerabilityReport when direct fetch fails (e.g. Trivy uses hash-based names when full name > 63 chars).
+ * Uses Argo CD resource-tree to discover all VulnerabilityReports in namespace, fetches each and matches by labels.
+ * Note: Hash computation is not replicated (Trivy uses Go spew + k8s SafeEncodeString) - resource-tree is the fallback.
  */
 async function findReportByLabels(fallbackConfig) {
   if (!fallbackConfig?.appName) return undefined;
 
-  const { appName, resourceNamespace, resourceKind, resourceName, containerName } = fallbackConfig;
+  const { appName, resourceNamespace, resourceName, containerName } = fallbackConfig;
   const treeUrl = `${window.location.origin}/api/v1/applications/${appName}/resource-tree`;
   const resourceUrl = `${window.location.origin}/api/v1/applications/${appName}/resource`;
 
   const treeResponse = await axios.get(treeUrl).catch(() => undefined);
   if (!treeResponse?.data?.nodes) return undefined;
 
-  const workloadKind = (resourceKind || '').toLowerCase();
-
+  // Get all VulnerabilityReports in namespace (parentRefs may be missing for operator-created resources)
   const reportNodes = treeResponse.data.nodes.filter(
     (n) =>
       (n.kind === 'VulnerabilityReport' || n.kind === 'vulnerabilityreport') &&
       (n.group === 'aquasecurity.github.io' || !n.group) &&
-      n.namespace === resourceNamespace &&
-      Array.isArray(n.parentRefs) &&
-      n.parentRefs.some(
-        (p) =>
-          (p.kind || '').toLowerCase() === workloadKind &&
-          p.name === resourceName &&
-          (p.namespace || '') === resourceNamespace
-      )
+      n.namespace === resourceNamespace
   );
 
   for (const node of reportNodes) {
