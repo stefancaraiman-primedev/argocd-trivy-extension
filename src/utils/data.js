@@ -2,20 +2,79 @@ import axios from 'axios';
 
 var vulnerabilityData = {}
 
-async function GetVulnerabilityData(reportUrl) {
+/**
+ * Fetch VulnerabilityReport by exact name (fails when Trivy uses hash for names > 63 chars).
+ */
+async function fetchReportByUrl(reportUrl) {
   const response = await axios.get(reportUrl)
-    .catch(function (error) {
-      // console.log(`No vulnerability report found matching: ${reportUrl}`)
-    })
+    .catch(function () {
+      return undefined;
+    });
+  return response;
+}
+
+/**
+ * Find VulnerabilityReport by labels when direct fetch fails (e.g. hash-based names).
+ * Uses Argo CD resource-tree to discover reports, then fetches each to match by labels.
+ */
+async function findReportByLabels(fallbackConfig) {
+  if (!fallbackConfig?.appName) return undefined;
+
+  const { appName, resourceNamespace, resourceKind, resourceName, containerName } = fallbackConfig;
+  const treeUrl = `${window.location.origin}/api/v1/applications/${appName}/resource-tree`;
+  const resourceUrl = `${window.location.origin}/api/v1/applications/${appName}/resource`;
+
+  const treeResponse = await axios.get(treeUrl).catch(() => undefined);
+  if (!treeResponse?.data?.nodes) return undefined;
+
+  const workloadKind = (resourceKind || '').toLowerCase();
+
+  const reportNodes = treeResponse.data.nodes.filter(
+    (n) =>
+      (n.kind === 'VulnerabilityReport' || n.kind === 'vulnerabilityreport') &&
+      (n.group === 'aquasecurity.github.io' || !n.group) &&
+      n.namespace === resourceNamespace &&
+      Array.isArray(n.parentRefs) &&
+      n.parentRefs.some(
+        (p) =>
+          (p.kind || '').toLowerCase() === workloadKind &&
+          p.name === resourceName &&
+          (p.namespace || '') === resourceNamespace
+      )
+  );
+
+  for (const node of reportNodes) {
+    const reportName = node.name;
+    const fetchUrl = `${resourceUrl}?name=${encodeURIComponent(reportName)}&namespace=${encodeURIComponent(resourceNamespace)}&resourceName=${encodeURIComponent(reportName)}&version=v1alpha1&kind=VulnerabilityReport&group=aquasecurity.github.io`;
+    const response = await axios.get(fetchUrl).catch(() => undefined);
+    if (!response?.data?.manifest) continue;
+
+    const manifest = JSON.parse(response.data.manifest);
+    const labels = manifest?.metadata?.labels || {};
+    const reportContainer = labels['trivy-operator.container.name'];
+
+    if (!containerName || reportContainer === containerName) {
+      return response;
+    }
+  }
+  return undefined;
+}
+
+async function GetVulnerabilityData(reportUrl, fallbackConfig) {
+  let response = await fetchReportByUrl(reportUrl);
+
+  if (response === undefined && fallbackConfig) {
+    response = await findReportByLabels(fallbackConfig);
+  }
 
   if (response === undefined) {
-    return []
+    return [];
   }
   return JSON.parse(response?.data?.manifest).report.vulnerabilities;
 }
 
-export async function GridData(reportUrl) {
-  const vulnData = await GetVulnerabilityData(reportUrl);
+export async function GridData(reportUrl, fallbackConfig) {
+  const vulnData = await GetVulnerabilityData(reportUrl, fallbackConfig);
 
   const data = [];
   vulnData.forEach(v => data.push([
@@ -33,8 +92,8 @@ export async function GridData(reportUrl) {
   return data
 }
 
-export async function DashboardData(reportUrl) {
-  vulnerabilityData = await GetVulnerabilityData(reportUrl);
+export async function DashboardData(reportUrl, fallbackConfig) {
+  vulnerabilityData = await GetVulnerabilityData(reportUrl, fallbackConfig);
 
   if (vulnerabilityData.length === 0) {
     return {
